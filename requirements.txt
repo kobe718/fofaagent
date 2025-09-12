@@ -1,0 +1,20 @@
+# 基础依赖
+langchain
+langgraph
+litellm
+python-dotenv
+pyyaml
+
+# 模型相关
+gpt4all
+langchain-openai
+
+# 网络请求
+requests
+httpx
+
+# SSH操作
+paramiko
+
+# 搜索引擎集成
+tavily-python
