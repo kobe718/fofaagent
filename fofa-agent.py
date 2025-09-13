@@ -5,21 +5,93 @@ import uuid
 import datetime
 import yaml
 import json
-import sys
-import random
-import string
 from typing import Optional, Dict, Any
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from dotenv import load_dotenv
 import litellm
-import httpx
 import requests
 
 try:
     from langchain_openai import ChatOpenAI
 except ImportError:
     ChatOpenAI = None
+
+# 确保中文显示正常
+yaml.Dumper.ignore_aliases = lambda *args: True
+
+# 模块导出标记
+__all__ = [
+    'fofa_search', 
+    'FofaAPI', 
+    'create_react_agent_for_fofa',
+    'format_results_to_yaml'
+]
+
+def parse_json_response(content: str, search_request: str) -> Dict[str, Any]:
+    """
+    解析JSON响应，处理可能的格式问题并提取结果，支持复杂的错误恢复策略
+    
+    Args:
+        content: 原始响应内容
+        search_request: 原始搜索请求
+        
+    Returns:
+        解析后的字典结果
+    """
+    try:
+        if not content or not isinstance(content, str):
+            return {"success": False, "error": "响应内容为空或格式不正确"}
+            
+        # 清理内容，尝试找到有效的JSON部分
+        if not content.startswith('{'):
+            start_pos = content.find('{')
+            if start_pos != -1:
+                content = content[start_pos:]
+        
+        if not content.endswith('}'):
+            # 尝试找到JSON的结束位置
+            end_pos = content.rfind('}')
+            if end_pos != -1:
+                content = content[:end_pos+1]
+        
+        # 规范化JSON格式
+        content = content.replace("'", '"')
+        content = content.replace('True', 'true').replace('False', 'false').replace('None', 'null')
+        
+        # 尝试直接解析
+        return json.loads(content)
+    except json.JSONDecodeError as json_error:
+        print(f"JSON解析错误: {str(json_error)}")
+        # 尝试使用正则表达式修复常见的JSON格式问题
+        try:
+            import re
+            # 移除行首的空格和制表符
+            content = re.sub(r'^\s+', '', content, flags=re.MULTILINE)
+            # 修复可能的不规范的JSON格式
+            # 1. 确保键值对中的键用双引号包裹
+            content = re.sub(r'(\w+):', r'"\1":', content)
+            # 2. 确保字符串值用双引号包裹，但保留已经是数字/布尔值/null的值
+            content = re.sub(r':\s*([^"\d\[\]{}:,\s][^:\[\]{}:,]*?)([\],})])', r':"\1"\2', content)
+            # 3. 移除多余的逗号
+            content = re.sub(r',\s*([}\]])', r'\1', content)
+            # 尝试再次解析
+            return json.loads(content)
+        except Exception as repair_error:
+            # 如果修复失败，尝试提取关键信息
+            try:
+                # 提取关键信息
+                total_match = re.search(r'total:?\s*(\d+)', content)
+                total = int(total_match.group(1)) if total_match else 0
+                results = []
+                # 返回基本的搜索结果结构
+                return {"success": True, "query": search_request, "total": total, "results": results, "size": len(results), "fields": "host,ip,port,title,protocol,banner,app"}
+            except:
+                # 最后的备选方案，返回空结果
+                return {"success": False, "error": f"无法解析JSON响应: {str(json_error)}", "query": search_request}
+    except Exception as e:
+        print(f"解析过程中发生错误: {str(e)}")
+        return {"success": False, "error": f"解析错误: {str(e)}", "query": search_request}
 
 # 加载.env文件中的环境变量
 load_dotenv()
@@ -30,7 +102,8 @@ MAX_RESULT = min(MAX_RESULT, 1000)
 
 def generate_scroll_id() -> str:
     """生成一个8位的随机字符串作为scrollid"""
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+    # 使用uuid生成随机字符串并截取前8位
+    return uuid.uuid4().hex[:8]
 
 class FofaAPI:
     """Fofa API客户端，用于封装与Fofa API的交互"""
@@ -196,12 +269,14 @@ REACT_AGENT_PROMPT = """你是一个专业的网络资产搜索助手，专注�
 请开始处理用户的网络资产搜索请求。"""
 
 def _coalesce(*values, default=None):
+    """获取第一个非None且非空的值"""
     for v in values:
         if v is not None and v != "":
             return v
     return default
 
 def create_openai_model():
+    """创建OpenAI模型实例"""
     if ChatOpenAI is None:
         raise ImportError("未安装 langchain-openai，请先安装: pip install langchain-openai")
 
@@ -225,10 +300,6 @@ def create_openai_model():
         params["base_url"] = base_url
 
     return ChatOpenAI(**params)
-
-def generate_session_id() -> str:
-    """生成随机会话ID"""
-    return f"fofa-agent-{uuid.uuid4().hex[:8]}"
 
 def create_react_agent_for_fofa():
     """创建配置好Fofa搜索工具的React Agent"""
@@ -257,6 +328,25 @@ def ensure_tmp_directory():
         os.makedirs(tmp_dir)
     return tmp_dir
 
+def load_search_result_from_file(scroll_id: str) -> dict:
+    """从.tmp目录加载之前保存的搜索结果"""
+    tmp_dir = ensure_tmp_directory()
+    file_path = os.path.join(tmp_dir, f"{scroll_id}.json")
+    
+    if not os.path.exists(file_path):
+        return None
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        print(f"错误: 无法解析scrollid为'{scroll_id}'的搜索结果文件")
+        return None
+    except Exception as e:
+        print(f"错误: 读取scrollid为'{scroll_id}'的搜索结果时出错: {str(e)}")
+        return None
+
+
 def save_search_result_to_file(scroll_id, search_data):
     """将搜索结果保存到.tmp目录下，使用scrollid作为文件名"""
     tmp_dir = ensure_tmp_directory()
@@ -264,18 +354,6 @@ def save_search_result_to_file(scroll_id, search_data):
     with open(file_path, 'w', encoding='utf-8') as f:
         json.dump(search_data, f, ensure_ascii=False, indent=2)
     return file_path
-
-def load_search_result_from_file(scroll_id):
-    """从.tmp目录下加载搜索结果"""
-    tmp_dir = ensure_tmp_directory()
-    file_path = os.path.join(tmp_dir, f"{scroll_id}.json")
-    if not os.path.exists(file_path):
-        return None
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except:
-        return None
 
 def format_results_to_yaml(search_results, user_query, cumulative_assets=None, current_page=1, total_pages=1):
     """
@@ -318,7 +396,7 @@ def format_results_to_yaml(search_results, user_query, cumulative_assets=None, c
             
             for idx, item in enumerate(results, start_idx):
                 asset = {
-                    'no': idx,
+                    'id': idx,
                     'host': '',
                     'ip': '',
                     'port': '',
@@ -439,7 +517,7 @@ def main():
             
             for idx, item in enumerate(current_page_results, start_idx):
                 asset = {
-                    'no': idx,
+                    'id': idx,
                     'host': '',
                     'ip': '',
                     'port': '',
@@ -511,7 +589,7 @@ def main():
         agent = create_react_agent_for_fofa()
         
         # 生成会话ID
-        session_id = generate_session_id()
+        session_id = f"fofa-agent-{uuid.uuid4().hex[:8]}"
         # 配置递归限制和线程ID
         config = {
             "configurable": {"thread_id": session_id},
@@ -534,50 +612,11 @@ def main():
         ):
             if "tools" in chunk:
                 for tool_call in chunk["tools"]["messages"]:
-                    # 尝试解析工具调用结果为字典
                     try:
                         content = tool_call.content
-                        # 检查是否是字典格式的字符串
                         if content and isinstance(content, str):
-                            # 尝试直接解析为字典
-                            if content.startswith('{') and ('success:' in content or '"success"' in content):
-                                # 确保content是有效的JSON格式，处理可能的格式问题
-                                # 替换可能的单引号为双引号
-                                content = content.replace("'", '"')
-                                # 规范化JSON格式
-                                content = content.replace('True', 'true').replace('False', 'false').replace('None', 'null')
-                                
-                                # 尝试使用json.loads解析
-                                try:
-                                    search_results = json.loads(content)
-                                except Exception as json_error:
-                                    print(f"JSON解析错误: {str(json_error)}")
-                                    # 如果json.loads失败，尝试清理字符串后再解析
-                                    try:
-                                        # 进一步清理字符串，移除可能的语法错误
-                                        import re
-                                        # 移除行首的空格和制表符
-                                        content = re.sub(r'^\s+', '', content, flags=re.MULTILINE)
-                                        # 修复可能的不规范的JSON格式
-                                        # 1. 确保键值对中的键用双引号包裹
-                                        content = re.sub(r'(\w+):', r'"\1":', content)
-                                        # 2. 确保字符串值用双引号包裹，但保留已经是数字/布尔值/null的值
-                                        content = re.sub(r':\s*([^"\d\[\]{}:,\s][^:\[\]{}:,]*?)([\],})])', r':"\1"\2', content)
-                                        # 3. 移除多余的逗号
-                                        content = re.sub(r',\s*([}\]])', r'\1', content)
-                                        # 尝试再次解析
-                                        search_results = json.loads(content)
-                                    except Exception as clean_error:
-                                        print(f"清理后解析错误: {str(clean_error)}")
-                                        # 如果还是失败，尝试使用更简单的方法提取信息
-                                        try:
-                                            # 提取关键信息
-                                            total = int(re.search(r'total:?\s*(\d+)', content).group(1)) if re.search(r'total:?\s*(\d+)', content) else 0
-                                            results = []
-                                            search_results = {"success": True, "query": search_request, "total": total, "results": results, "size": len(results), "fields": "host,ip,port,title,protocol,banner,app"}
-                                        except:
-                                            search_results = {"success": False, "error": "无法解析工具调用结果"}
-                                
+                            # 使用新的parse_json_response函数简化JSON解析
+                            search_results = parse_json_response(content, search_request)
                             break  # 获取到结果后立即跳出循环
                     except Exception as e:
                         print(f"解析结果错误: {str(e)}")
