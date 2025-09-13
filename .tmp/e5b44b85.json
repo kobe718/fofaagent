@@ -2,7 +2,7 @@
   "query": "title=\"Apache\" || product=\"Apache\"",
   "total": 0,
   "scroll_id": "e5b44b85",
-  "next_page_index": 0,
+  "next_page_index": 20,
   "results": [
     [
       "103.29.176.199:89",

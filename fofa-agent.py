@@ -370,7 +370,7 @@ def format_results_to_yaml(search_results, user_query, cumulative_assets=None, c
         YAML格式的结果字符串
     """
     try:
-        if not search_results or not search_results.get('success'):
+        if not search_results:
             return ""
         
         # 获取当前时间戳
@@ -384,76 +384,78 @@ def format_results_to_yaml(search_results, user_query, cumulative_assets=None, c
         if total == 0 and search_results.get('size', 0) > 0:
             total = search_results.get('size', 0)
         
-        # 获取资产列表
-        assets = cumulative_assets or []
-        if not assets:
-            # 如果没有累计资产，则从搜索结果中获取
-            fields = search_results.get('fields', 'host,ip,port,title,protocol,banner,product').split(',')
-            results = search_results.get('results', [])
-            
-            # 计算当前页资产的起始序号
-            start_idx = 1
-            
-            for idx, item in enumerate(results, start_idx):
-                asset = {
-                    'id': idx,
-                    'host': '',
-                    'ip': '',
-                    'port': '',
-                    'protocol': '',
-                    'banner': '',
-                    'title': '',
-                    'product': ''
-                }
-                
-                # 填充资产信息
-                for i, field in enumerate(fields):
-                    if i < len(item) and item[i]:
-                        if field.lower() in asset:
-                            asset[field.lower()] = item[i]
-                
-                assets.append(asset)
-        
-        # 获取scroll_id
-        scroll_id = search_results.get('scroll_id', '')
-        
         # 确保current_page和total_pages是整数
         current_page = int(current_page)
         total_pages = int(total_pages)
         
-        # 构建YAML数据结构
+        # 获取scroll_id - 这个会从main函数中传递过来
+        scroll_id = search_results.get('scroll_id', '')
+        
+        # 从main函数传递的search_results中直接获取results数据
+        results = search_results.get('results', [])
+        
+        # 构建Python字典，然后使用yaml.dump()进行格式化
         yaml_data = {
-            'timestamp': timestamp,
-            'query': user_query,
-            'search': search_query,
-            'total': total,
-            'current_page': current_page,
-            'total_pages': total_pages,
-            'assets': assets,
-            'scrollid': scroll_id
+            "timestamp": timestamp,
+            "query": user_query,
+            "search": search_query,
+            "total": total,
+            "current_page": current_page,
+            "total_pages": total_pages
         }
         
-        # 转换为YAML格式，处理可能的中文和特殊字符
+        # 添加assets部分
+        if results:
+            # 处理assets数据
+            i=0
+            formatted_assets = []
+            for asset in results:
+                i += 1
+                formatted_asset = {
+                    "id": i,
+                    "host": asset[0],
+                    "ip": asset[1],
+                    "port": asset[2],
+                    "title": asset[3],
+                    "protocol": asset[4],
+                    "banner": asset[5],
+                    "product": asset[6]
+                }
+                formatted_assets.append(formatted_asset)
+            yaml_data["assets"] = formatted_assets
+        else:
+            yaml_data["assets"] = []
+        
+        # 添加scrollid字段
+        if scroll_id:
+            yaml_data["scrollid"] = scroll_id
+        
+        # 使用yaml.dump()将Python字典转换为YAML格式
+        # default_flow_style=False 确保使用块样式而不是流样式
+        # allow_unicode=True 确保中文正常显示
         yaml_output = yaml.dump(
             yaml_data,
-            allow_unicode=True,
             default_flow_style=False,
-            sort_keys=False,
-            indent=2
+            allow_unicode=True,
+            sort_keys=False  # 保持键的顺序
         )
+        
         return yaml_output
     except Exception as e:
         # 如果格式化过程出错，返回错误信息的YAML格式
         error_data = {
-            'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'query': user_query,
-            'error': f'YAML格式化错误: {str(type(e))} - {str(e)}'
+            "timestamp": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "query": user_query,
+            "error": f"YAML格式化错误: {str(type(e))} - {str(e)}"
         }
-        return yaml.dump(error_data, allow_unicode=True)
+        return yaml.dump(error_data, allow_unicode=True, default_flow_style=False)
 
 
 def main():
     """主程序入口，接受搜索请求或scrollid参数"""
+    # 导入sys模块
+    import sys
+    
     # 检查参数
     if len(sys.argv) != 2:
         print("用法: python fofa-agent.py '查找域名example.com的所有资产' 或 python fofa-agent.py 'scrollid: xxxxxxx'")
@@ -485,6 +487,13 @@ def main():
             search_query = saved_data.get('query', '')
             next_page_index = saved_data.get('next_page_index', 0)
             total_fetched = len(all_results)
+            
+            # 修复next_page_index过大的问题
+            if next_page_index >= len(all_results):
+                # 如果next_page_index超过了结果总数，重新设置为0（显示第一页）
+                next_page_index = 0
+                saved_data['next_page_index'] = next_page_index
+                save_search_result_to_file(scroll_id, saved_data)
             
             # 计算总页数
             total_pages = (len(all_results) + 19) // 20  # 向上取整
@@ -536,6 +545,7 @@ def main():
                 formatted_assets.append(asset)
             
             # 格式化结果
+            # 总是包含scroll_id，不管是否有下一页
             result_dict = {
                 "success": True,
                 "query": search_query,
@@ -543,7 +553,7 @@ def main():
                 "size": len(current_page_results),
                 "results": current_page_results,
                 "fields": "host,ip,port,title,protocol,banner,product",
-                "scroll_id": scroll_id if new_next_page_index < len(all_results) else None
+                "scroll_id": scroll_id  # 始终传递scroll_id
             }
             
             # 计算当前页码
@@ -593,7 +603,7 @@ def main():
         # 配置递归限制和线程ID
         config = {
             "configurable": {"thread_id": session_id},
-            "recursion_limit": 50  # 增加递归限制到50
+            "recursion_limit": 20  # 增加递归限制到20
         }
         
         # 添加系统提示，确保agent了解新功能
