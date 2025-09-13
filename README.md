@@ -1,36 +1,29 @@
-# Fofa搜索Agent
+# Fofa智能搜索Agent
 
 这是一个基于LangGraph框架构建的智能Agent，集成了Fofa网络资产搜索功能，可以帮助用户快速查询和分析网络资产信息。
-
-## LangSmith中只显示system_message的原因
-
-在代码实现中，FOFA Agent有两个层次的提示词设置：
-
-1. **REACT_AGENT_PROMPT**：在`create_react_agent_for_fofa()`函数中通过`prompt`参数传递给`create_react_agent()`
-2. **system_message**：在`fofa_agentic_search()`函数中通过`agent.stream()`的`messages`参数传递
-
-在LangSmith中只看到system_message而看不到REACT_AGENT_PROMPT的原因是：
-- `create_react_agent()`函数将prompt封装在Agent内部结构中，作为Agent的基础指令
-- `agent.stream()`方法传递的messages是实际发送给模型的对话历史，包括系统消息和用户查询
-- LangSmith主要跟踪和显示实际与模型交互的消息序列，而不是Agent的内部配置参数
-
-这种设计是合理的，因为基础prompt定义了Agent的长期行为模式，而system_message提供了针对特定任务的即时指令。
 
 ## 功能特性
 
 - 🧠 **智能推理**：基于大语言模型实现的推理-反思-行动循环
 - 🔍 **Fofa搜索**：集成Fofa API，支持网络资产搜索
-- 🌐 **Tavily搜索**：获取互联网上的相关信息
-- 🖥️ **SSH操作**：远程连接Linux主机执行命令
+- 📃 **结果分页**：支持使用scrollid滚动分页查看大量结果
+- 💾 **结果保存**：自动将搜索结果保存到文件系统
+- 📊 **结构化输出**：使用YAML格式输出结构化搜索结果
 
 ## 环境要求
 
 - Python 3.8+ 
 - 安装相关依赖：`pip install -r requirements.txt`
 
+## 安装依赖
+
+```bash
+pip install -r requirements.txt
+```
+
 ## 配置说明
 
-1. 复制`.env`文件中的示例配置，替换为您自己的API密钥
+1. 复制`.env.example`文件为`.env`，替换为您自己的API密钥
 
 ```
 # OpenAI配置
@@ -42,42 +35,42 @@ OPENAI_MODEL=gpt-4o-mini
 FOFA_EMAIL=your_email@example.com
 FOFA_API_KEY=your_fofa_api_key_here
 
-# Tavily API配置
-TAVILY_API_KEY=your_tavily_api_key_here
+# 调试模式
+DEBUG=false
 ```
 
 2. 关键配置说明：
    - `OPENAI_API_KEY`：OpenAI API密钥
    - `FOFA_EMAIL`和`FOFA_API_KEY`：Fofa账号和API密钥
-   - `TAVILY_API_KEY`：Tavily搜索引擎API密钥
-
-## 安装依赖
-
-```bash
-pip install -r requirements.txt
-```
+   - `DEBUG`：设置为true启用详细日志输出
 
 ## 使用方法
 
-1. 启动Agent
+1. 基本搜索
 
 ```bash
-python react_agent.py
+python fofaagent.py '查找域名example.com的所有资产'
 ```
 
-2. 使用示例：
+2. 查看下一页结果
+
+当搜索结果超过20条时，可以使用返回的scrollid查看下一页：
+
+```bash
+python fofaagent.py 'scrollid: xxxxxxxx'
+```
+
+3. 使用示例：
 
    - **Fofa搜索示例**：
-     ```
-     请搜索domain="example.com"的网络资产，返回前5条结果
-     ```
-     ```
-     请帮我查找title包含"登录"的网站，返回前10条
+     ```bash
+     python fofaagent.py '请搜索domain="example.com"的网络资产'
+     python fofaagent.py '请帮我查找title包含"登录"的网站'
      ```
 
    - **组合查询示例**：
-     ```
-     请搜索country="CN" && app="nginx"的服务器，返回IP和端口信息
+     ```bash
+     python fofaagent.py '请搜索country="CN" && app="nginx"的服务器'
      ```
 
 ## Fofa搜索语法
@@ -92,12 +85,25 @@ Fofa支持丰富的搜索语法，常用的语法包括：
 - `country="CN"`：搜索特定国家的资产
 - 逻辑运算符：`&&`（与）、`||`（或）、`!`（非）
 
+## 项目结构
+
+```
+fofa-agent/
+├── fofaagent.py       # 主要的Agent实现文件
+├── fofaclient.py      # Fofa API的客户端实现
+├── .env.example       # 环境变量配置示例
+├── .gitignore         # Git忽略文件
+├── README.md          # 项目说明文档
+└── requirements.txt   # 项目依赖
+```
+
 ## 注意事项
 
 1. Fofa API有调用次数限制，请合理使用
 2. 确保.env文件中的API密钥正确配置
-3. 对于大批量数据查询，建议调整size参数
+3. 搜索结果默认保存到本地文件系统
 4. 使用前请确保安装了所有必要的依赖包
+5. 程序默认支持自动分页获取最多5000个资产，每次返回20条
 
 ## 常见问题
 
@@ -107,9 +113,9 @@ A: 请检查.env文件中的FOFA_EMAIL和FOFA_API_KEY是否正确配置。
 **Q: 搜索结果为空？**
 A: 请检查搜索语法是否正确，或者尝试调整搜索条件。
 
-**Q: 如何获取更多返回字段？**
-A: 可以在搜索时指定fields参数，例如：`fields="host,ip,port,title,domain,protocol"`
+**Q: 如何获取更多日志信息？**
+A: 将.env文件中的DEBUG设置为true，可以启用详细日志输出。
 
 ## 更新日志
 
-- v1.0：初始版本，集成Fofa搜索、Tavily搜索和SSH功能
+- v1.0：初始版本，集成Fofa搜索、结果分页和保存功能
