@@ -1,16 +1,23 @@
 import sys
 import os
-import base64
-import uuid
 import datetime
 import yaml
+import uuid
 import json
 from typing import Optional, Dict, Any
 from langchain_core.tools import tool
 from langgraph.prebuilt import create_react_agent
 from dotenv import load_dotenv
-import litellm
-import requests
+from langsmith import traceable
+
+# 导入Fofa客户端功能
+from fofaclient import (
+    FofaAPI,
+    load_search_result_from_file,
+    save_search_result_to_file,
+    MAX_RESULT
+)
+
 
 try:
     from langchain_openai import ChatOpenAI
@@ -22,49 +29,87 @@ yaml.Dumper.ignore_aliases = lambda *args: True
 
 # 模块导出标记
 __all__ = [
-    'fofa_search', 
-    'FofaAPI', 
-    'create_react_agent_for_fofa',
-    'format_results_to_yaml'
+    'fofa_agentic_search'
 ]
 
-def parse_json_response(content: str, search_request: str) -> Dict[str, Any]:
+def generate_scroll_id() -> str:
+    """生成一个8位的随机字符串作为scrollid"""
+    # 使用uuid生成随机字符串并截取前8位
+    return uuid.uuid4().hex[:8]
+
+def parse_json_response(content: str, search_request: str, test_error: bool = False) -> Dict[str, Any]:
     """
     解析JSON响应，处理可能的格式问题并提取结果，支持复杂的错误恢复策略
     
     Args:
         content: 原始响应内容
         search_request: 原始搜索请求
+        test_error: 是否启用测试模式（故意制造JSON解析错误）
         
     Returns:
         解析后的字典结果
     """
     try:
+        # 测试模式：故意生成格式错误的JSON
+        if test_error and content and isinstance(content, str):
+            print("[测试模式] 启用JSON解析错误测试")
+            # 制造一个故意的JSON格式错误 - 移除逗号
+            if '}, {' in content:
+                content = content.replace('}, {', '}{')
+            print(f"[测试模式] 已修改JSON内容，尝试触发解析错误")
+        
         if not content or not isinstance(content, str):
+            print(f"[解析警告] 响应内容为空或格式不正确，类型: {type(content)}")
             return {"success": False, "error": "响应内容为空或格式不正确"}
             
+        # 记录原始内容长度和前100个字符，便于调试
+        content_preview = content[:100] + ('...' if len(content) > 100 else '')
+        print(f"[解析信息] 开始解析响应 (长度: {len(content)}, 前100字符: {content_preview})")
+            
         # 清理内容，尝试找到有效的JSON部分
+        # 处理开头格式问题
         if not content.startswith('{'):
             start_pos = content.find('{')
             if start_pos != -1:
+                print(f"[解析调整] 非JSON开头，从位置{start_pos}开始截取")
                 content = content[start_pos:]
         
-        if not content.endswith('}'):
+        # 处理结尾格式问题
+        # 移除末尾可能的右括号')'，这是Fofa API常见的格式问题
+        if content.endswith('})'):
+            print("[解析调整] 检测到JSON末尾包含多余的')'，已移除")
+            content = content[:-1]  # 移除末尾的')'
+        elif not content.endswith('}'):
             # 尝试找到JSON的结束位置
             end_pos = content.rfind('}')
             if end_pos != -1:
+                print(f"[解析调整] 非JSON结尾，截取到位置{end_pos+1}")
                 content = content[:end_pos+1]
         
         # 规范化JSON格式
+        original_length = len(content)
         content = content.replace("'", '"')
         content = content.replace('True', 'true').replace('False', 'false').replace('None', 'null')
+        print(f"[解析调整] 规范化JSON格式 (长度从{original_length}变为{len(content)})")
         
         # 尝试直接解析
-        return json.loads(content)
+        result = json.loads(content)
+        print(f"[解析成功] 成功解析JSON响应")
+        return result
     except json.JSONDecodeError as json_error:
-        print(f"JSON解析错误: {str(json_error)}")
+        # 获取错误位置的上下文
+        error_pos = json_error.pos
+        context_start = max(0, error_pos - 20)
+        context_end = min(len(content), error_pos + 20)
+        error_context = content[context_start:context_end]
+        
+        print(f"[解析错误] JSON解析失败: {str(json_error)}")
+        print(f"[错误位置] 位置: {error_pos}, 上下文: '{error_context}'")
+        print(f"[原始请求] {search_request}")
+        
         # 尝试使用正则表达式修复常见的JSON格式问题
         try:
+            print("[解析尝试] 尝试使用正则表达式修复JSON格式")
             import re
             # 移除行首的空格和制表符
             content = re.sub(r'^\s+', '', content, flags=re.MULTILINE)
@@ -75,134 +120,106 @@ def parse_json_response(content: str, search_request: str) -> Dict[str, Any]:
             content = re.sub(r':\s*([^"\d\[\]{}:,\s][^:\[\]{}:,]*?)([\],})])', r':"\1"\2', content)
             # 3. 移除多余的逗号
             content = re.sub(r',\s*([}\]])', r'\1', content)
+            
+            # 记录修复后的内容预览
+            fixed_preview = content[:100] + ('...' if len(content) > 100 else '')
+            print(f"[解析尝试] 修复后内容 (前100字符): {fixed_preview}")
+            
             # 尝试再次解析
-            return json.loads(content)
+            result = json.loads(content)
+            print("[解析成功] 修复后JSON解析成功")
+            return result
         except Exception as repair_error:
+            print(f"[解析失败] JSON修复失败: {str(repair_error)}")
             # 如果修复失败，尝试提取关键信息
             try:
+                print("[解析尝试] 尝试提取关键信息")
                 # 提取关键信息
+                import re
                 total_match = re.search(r'total:?\s*(\d+)', content)
                 total = int(total_match.group(1)) if total_match else 0
                 results = []
                 # 返回基本的搜索结果结构
+                print(f"[解析尝试] 成功提取部分信息，total={total}")
                 return {"success": True, "query": search_request, "total": total, "results": results, "size": len(results), "fields": "host,ip,port,title,protocol,banner,app"}
             except:
+                print("[解析失败] 无法提取任何有效信息")
                 # 最后的备选方案，返回空结果
                 return {"success": False, "error": f"无法解析JSON响应: {str(json_error)}", "query": search_request}
     except Exception as e:
-        print(f"解析过程中发生错误: {str(e)}")
+        print(f"[解析异常] 解析过程中发生未知错误: {str(type(e))} - {str(e)}")
         return {"success": False, "error": f"解析错误: {str(e)}", "query": search_request}
 
 # 加载.env文件中的环境变量
 load_dotenv()
 
-# 从.env读取MAX_RESULT配置，默认200，最大不超过1000
-MAX_RESULT = int(os.environ.get("FOFA_MAX_RESULT", "200"))
-MAX_RESULT = min(MAX_RESULT, 1000)
+LANGSMITH_API_KEY = os.environ.get("LANGSMITH_API_KEY")
 
-def generate_scroll_id() -> str:
-    """生成一个8位的随机字符串作为scrollid"""
-    # 使用uuid生成随机字符串并截取前8位
-    return uuid.uuid4().hex[:8]
+if LANGSMITH_API_KEY:
+    try:
+        # 设置全局Langsmith跟踪配置
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_ENDPOINT"] = os.environ.get("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com")
+        os.environ["LANGCHAIN_PROJECT"] = os.environ.get("LANGCHAIN_PROJECT", "fofa-agent")
+        
+        print("Langsmith跟踪已启用")
+    except Exception as e:
+        print(f"配置Langsmith跟踪时出错: {str(e)}")
+        # 即使配置失败，也继续执行程序
 
-class FofaAPI:
-    """Fofa API客户端，用于封装与Fofa API的交互"""
-    def __init__(self, email: Optional[str] = None, api_key: Optional[str] = None):
-        # 优先使用传入的参数，如果没有则从环境变量中获取
-        self.email = email or os.environ.get("FOFA_EMAIL")
-        self.api_key = api_key or os.environ.get("FOFA_API_KEY")
-        self.base_url = "https://fofa.info/api/v1/search/all"
-        
-        # 验证必要的认证信息
-        if not self.email or not self.api_key:
-            raise ValueError("未配置Fofa API认证信息，请设置FOFA_EMAIL和FOFA_API_KEY环境变量")
-            
-    def search(self, query_str: str, size: int = 10, fields: str = "host,ip,port,title", scroll: Optional[str] = None) -> Dict[str, Any]:
-        # 限制单次搜索结果不超过MAX_RESULT个
-        if size > MAX_RESULT:
-            size = MAX_RESULT
-        # 限制单次返回结果数量为20个
-        page_size = min(size, 20)
-        """
-        执行Fofa搜索
-        
-        Args:
-            query_str: 查询字符串，遵循Fofa搜索语法
-            size: 返回结果的数量，默认为10
-            fields: 返回的字段，默认为"host,ip,port,title"
-            scroll: scroll_id，用于分页查询
-        
-        Returns:
-            包含搜索结果的字典
-        """
-        # 对查询字符串进行Base64编码
-        qbase64 = base64.b64encode(query_str.encode('utf-8')).decode('utf-8')
-        
-        # 构建请求参数
-        params = {
-            'email': self.email,
-            'key': self.api_key,
-            'qbase64': qbase64,
-            'size': size,
-            'fields': fields
-        }
-        
-        # 如果提供了scroll_id，则添加到参数中
-        if scroll:
-            params['scroll'] = scroll
-        
-        try:
-            # 发送请求，禁用SSL验证以解决证书问题
-            response = requests.get(self.base_url, params=params, verify=True)
-            
-            # 检查响应状态
-            if response.status_code == 200:
-                data = response.json()
-                
-                # 检查API返回的状态
-                if data.get('error') == False:
-                    return data
-                else:
-                    raise Exception(f"Fofa API错误: {data.get('errmsg')}")
-            else:
-                raise Exception(f"HTTP请求错误: 状态码 {response.status_code}")
-        except Exception as e:
-            raise Exception(f"搜索过程中发生错误: {str(e)}")
+
 
 @tool
+@traceable
 def fofa_search(
     query: str,
+    scrollid: str,
     size: int = 10,
-    fields: str = "host,ip,port,title,protocol,banner,product",
-    scroll: Optional[str] = None
-) -> dict:
+    fields: str = "host,ip,port,title,protocol,banner,product,country_name,region,city",
+    ) -> dict:
     """
     使用Fofa API搜索网络资产
     
     Args:
         query: 搜索查询条件，遵循Fofa搜索语法，例如：domain="example.com"、title="登录"
+        scrollid: 搜索id，8位随机字母数字
         size: 最大结果数量，默认10
         fields: 返回的字段，默认包含host,ip,port,title,protocol,banner,product
         
     Returns:
-        包含搜索结果的字典
+        包含搜索结果的字典（成功时返回除完整results外的数据和3个样例）
     """
     try:
         # 创建FofaAPI实例
         fofa = FofaAPI()
         
         # 执行搜索
-        result = fofa.search(query_str=query, size=size, fields=fields, scroll=scroll)
+        result = fofa.search(query_str=query, size=size, fields=fields)
         
-        # 返回原始结果数据，让外部处理格式化
+        # 获取完整结果数据
+        full_results = result.get('results', [])
+        total = result.get('total', 0)
+        
+        # 生成scrollid并保存原始结果到文件
+        scroll_id = scrollid
+        saved_data = {
+            'query': query,
+            'total': total,
+            'scroll_id': scroll_id,
+            'results': full_results,
+            'fields': fields
+        }
+        save_search_result_to_file(scroll_id, saved_data)
+        
+        # 返回除完整results外的数据和3个样例给模型，让模型只判断搜索是否正确
         return {
             "success": True,
             "query": query,
-            "total": result.get('total', 0),
-            "size": result.get('size', 0),
-            "results": result.get('results', []),
+            "total": total,
+            "size": len(full_results),
+            "results_sample": full_results[:3],  # 只返回前3个结果作为样例
             "fields": fields,
-            "scroll_id": result.get('scroll_id')
+            "scroll_id": scroll_id  # 返回生成的scrollid，以便后续可以从文件中读取完整结果
         }
         
     except Exception as e:
@@ -212,7 +229,7 @@ def fofa_search(
         }
 
 # React Agent的提示词，专注于资产搜索任务
-REACT_AGENT_PROMPT = """你是一个专业的网络资产搜索助手，专注于使用Fofa API进行网络资产查询。
+REACT_AGENT_PROMPT = """你是一个专业的网络资产搜索助手，专注于使用Fofa API进行网络资产查询。你具备智能搜索策略优化能力，可以通过多次尝试不同的查询组合找到最佳解决方案。
 
 ## 工作流程
 你必须严格按照以下模式工作：
@@ -222,18 +239,27 @@ REACT_AGENT_PROMPT = """你是一个专业的网络资产搜索助手，专注�
    - 思考如何将自然语言请求转换为正确的Fofa搜索语法
    - 确定合适的搜索参数（如结果数量）
 
-2. **行动（Action）**: 
+2. **行动与优化（Action & Optimization）**: 
    - 唯一可用的工具是fofa_search，必须使用它来执行搜索
-   - 确保搜索语法符合Fofa要求
-   - 不需要指定fields参数，使用默认值即可
+   - 首先使用最精确的搜索条件尝试
+   - 记录每次搜索的结果质量（包括相关性、数量、精确性等）
+   - 基于结果分析，智能调整搜索策略：
+     * 如果结果过多（>2000条），尝试增加筛选条件或使用更精确的关键词
+     * 如果结果过少（<10条），尝试减少限制条件或使用更通用的关键词
+     * 如果结果不相关，尝试替换同义词或调整搜索字段
+     * 在探索最优搜索条件的过程中，可以把size设置的小一些，减少api的消耗，关注结果中的size总量，找到总量最多的查询组合
 
-3. **反思与重试（Reflection & Retry）**: 
-   - 评估搜索结果是否成功：
-     * 如返回的结果中success为false，**不输出任何内容**，立即反思并优化搜索策略
-     * 如返回有效结果（success为true），继续处理
-   - 持续优化：如搜索结果不满足用户需求或匹配数量过少，调整搜索条件重新搜索
-   - 停止条件：当搜索结果满足用户需求（如达到指定结果数量）或连续3次搜索仍无法获得有效结果时，停止搜索
-   - 最终输出：仅在成功搜索到有效结果后，**原封不动**地返回fofa_search的结果（不要添加任何额外解释或格式化）
+3. **策略比较与选择（Comparison & Selection）**: 
+   - 在多次尝试后，根据以下标准选择最佳查询组合：
+     * 相关性：结果是否与用户需求高度匹配
+     * 数量：既不过多也不过少（理想范围10-2000条）
+     * 精确度：是否准确反映用户指定的搜索条件
+   - 对于复杂查询，可以尝试多种组合方式并比较结果
+   - 停止条件：当找到满意的查询组合或已尝试5种不同策略时，停止搜索
+
+4. **最终输出（Final Output）**: 
+   - 仅在找到最佳查询组合并获得有效结果后，**原封不动**地返回该查询的fofa_search结果
+   - 我会记录每次工具调用的结果，并以最后一次工具调用的结果作为最终输出，务必确保最后以最优的搜索条件进行一次搜索
 
 ## 可用工具
 
@@ -258,7 +284,7 @@ REACT_AGENT_PROMPT = """你是一个专业的网络资产搜索助手，专注�
 2. **精确转换**: 准确将自然语言转换为Fofa搜索语法
 3. **结果清晰**: 以结构化方式呈现搜索结果
 4. **用户至上**: 确保搜索结果满足用户需求
-5. **结果管理**: 一次整理所有的结果并输出，不要添加任何影响后续json解析的内容
+5. **结果管理**: 对最终的所使用的搜索条件进行总结和说明
 
 ## 重要规则
 1. **静默重试**: 搜索失败或结果无效时，**必须完全静默处理**，不向用户输出任何中间过程信息
@@ -277,37 +303,29 @@ def _coalesce(*values, default=None):
 
 def create_openai_model():
     """创建OpenAI模型实例"""
-    if ChatOpenAI is None:
-        raise ImportError("未安装 langchain-openai，请先安装: pip install langchain-openai")
 
-    model_name = _coalesce(
-        os.environ.get("OPENAI_MODEL"),
-        default="gpt-4o-mini",
-    )
+    model_name = os.environ.get("OPENAI_MODEL")
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("缺少 OPENAI_API_KEY，请设置环境变量")
 
     base_url = os.environ.get("OPENAI_BASE_URL")
-    temperature = float(_coalesce(os.environ.get("OPENAI_TEMPERATURE"), 0.7))
 
     params = {
         "model": model_name,
         "api_key": api_key,
-        "temperature": temperature,
+        "temperature": 0.7,
     }
     if base_url:
         params["base_url"] = base_url
 
     return ChatOpenAI(**params)
 
+@traceable
 def create_react_agent_for_fofa():
     """创建配置好Fofa搜索工具的React Agent"""
     # 创建模型
     model = create_openai_model()
-    
-    # 配置litellm
-    litellm.drop_params = True
     
     # 工具列表
     tools = [fofa_search]
@@ -321,39 +339,7 @@ def create_react_agent_for_fofa():
     
     return agent
 
-def ensure_tmp_directory():
-    """确保.tmp目录存在"""
-    tmp_dir = os.path.join(os.getcwd(), '.tmp')
-    if not os.path.exists(tmp_dir):
-        os.makedirs(tmp_dir)
-    return tmp_dir
 
-def load_search_result_from_file(scroll_id: str) -> dict:
-    """从.tmp目录加载之前保存的搜索结果"""
-    tmp_dir = ensure_tmp_directory()
-    file_path = os.path.join(tmp_dir, f"{scroll_id}.json")
-    
-    if not os.path.exists(file_path):
-        return None
-    
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except json.JSONDecodeError:
-        print(f"错误: 无法解析scrollid为'{scroll_id}'的搜索结果文件")
-        return None
-    except Exception as e:
-        print(f"错误: 读取scrollid为'{scroll_id}'的搜索结果时出错: {str(e)}")
-        return None
-
-
-def save_search_result_to_file(scroll_id, search_data):
-    """将搜索结果保存到.tmp目录下，使用scrollid作为文件名"""
-    tmp_dir = ensure_tmp_directory()
-    file_path = os.path.join(tmp_dir, f"{scroll_id}.json")
-    with open(file_path, 'w', encoding='utf-8') as f:
-        json.dump(search_data, f, ensure_ascii=False, indent=2)
-    return file_path
 
 def format_results_to_yaml(search_results, user_query, cumulative_assets=None, current_page=1, total_pages=1):
     """
@@ -391,9 +377,6 @@ def format_results_to_yaml(search_results, user_query, cumulative_assets=None, c
         # 获取scroll_id - 这个会从main函数中传递过来
         scroll_id = search_results.get('scroll_id', '')
         
-        # 从main函数传递的search_results中直接获取results数据
-        results = search_results.get('results', [])
-        
         # 构建Python字典，然后使用yaml.dump()进行格式化
         yaml_data = {
             "timestamp": timestamp,
@@ -405,26 +388,33 @@ def format_results_to_yaml(search_results, user_query, cumulative_assets=None, c
         }
         
         # 添加assets部分
-        if results:
-            # 处理assets数据
-            i=0
-            formatted_assets = []
-            for asset in results:
-                i += 1
-                formatted_asset = {
-                    "id": i,
-                    "host": asset[0],
-                    "ip": asset[1],
-                    "port": asset[2],
-                    "title": asset[3],
-                    "protocol": asset[4],
-                    "banner": asset[5],
-                    "product": asset[6]
-                }
-                formatted_assets.append(formatted_asset)
-            yaml_data["assets"] = formatted_assets
+        if cumulative_assets and isinstance(cumulative_assets, list) and len(cumulative_assets) > 0:
+            # 如果提供了cumulative_assets参数，优先使用它来格式化结果
+            yaml_data["assets"] = cumulative_assets
         else:
-            yaml_data["assets"] = []
+            # 从main函数传递的search_results中获取results数据
+            results = search_results.get('results', [])
+            if results:
+                # 处理assets数据
+                i=0
+                formatted_assets = []
+                for asset in results:
+                    i += 1
+                    formatted_asset = {
+                        "id": i,
+                        "host": asset[0],
+                        "ip": asset[1],
+                        "port": asset[2],
+                        "title": asset[3],
+                        "protocol": asset[4],
+                        "banner": asset[5],
+                        "product": asset[6],
+                        "location": f"{asset[7]},{asset[8]},{asset[9]}"
+                    }
+                    formatted_assets.append(formatted_asset)
+                yaml_data["assets"] = formatted_assets
+            else:
+                yaml_data["assets"] = []
         
         # 添加scrollid字段
         if scroll_id:
@@ -451,19 +441,24 @@ def format_results_to_yaml(search_results, user_query, cumulative_assets=None, c
         return yaml.dump(error_data, allow_unicode=True, default_flow_style=False)
 
 
-def main():
-    """主程序入口，接受搜索请求或scrollid参数"""
-    # 导入sys模块
-    import sys
+@traceable
+def fofa_agentic_search(search_request, test_json=False):
+    """处理FOFA搜索请求或滚动ID请求的核心功能函数
     
-    # 检查参数
-    if len(sys.argv) != 2:
-        print("用法: python fofa-agent.py '查找域名example.com的所有资产' 或 python fofa-agent.py 'scrollid: xxxxxxx'")
-        print(f"说明: 程序支持自动分页获取最多{MAX_RESULT}个资产，每次返回20条")
-        sys.exit(1)
+    参数:
+        search_request (str): 自然语言表述的搜索请求，或格式为"scrollid: xxxxxxx"的请求，用于对历史搜索结果进行分页获取
+        test_json (bool): 是否启用JSON解析错误测试模式
     
-    search_request = sys.argv[1]
+    功能:
+        - 处理搜索请求，使用agent执行搜索
+        - 处理滚动ID请求，分页加载并显示保存的搜索结果
+        - 支持自动分页获取更多结果（最多1000个）
+        - 格式化并输出YAML格式的结果
+        - 支持JSON解析错误测试模式，用于调试
     
+    返回:
+        None: 结果直接打印到标准输出
+    """
     # 检查是否是scrollid格式的请求
     if search_request.lower().startswith('scrollid: '):
         # 提取scrollid
@@ -471,14 +466,24 @@ def main():
         
         # 检查scrollid格式（8位字母数字）
         if not (len(scroll_id) == 8 and all(c.isalnum() for c in scroll_id)):
-            print("错误: scrollid必须是8位字母和数字的组合")
-            sys.exit(1)
+            error_data = {
+                'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'query': search_request,
+                'error': "scrollid必须是8位字母和数字的组合"
+            }
+            print(yaml.dump(error_data, allow_unicode=True))
+            return
         
         # 尝试加载之前保存的搜索结果
         saved_data = load_search_result_from_file(scroll_id)
         if not saved_data:
-            print(f"错误: 找不到scrollid为'{scroll_id}'的搜索结果")
-            sys.exit(1)
+            error_data = {
+                'timestamp': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'query': search_request,
+                'error': f"找不到scrollid为'{scroll_id}'的搜索结果"
+            }
+            print(yaml.dump(error_data, allow_unicode=True))
+            return
         
         try:
             # 获取所有保存的结果和相关信息
@@ -518,7 +523,7 @@ def main():
                 new_next_page_index = next_page_index
             
             # 准备字段列表
-            fields = "host,ip,port,title,protocol,banner,product".split(',')
+            fields = "host,ip,port,title,protocol,banner,product,country_name,region,city".split(',')
             
             # 将current_page_results转换为正确的资产列表格式
             formatted_assets = []
@@ -533,7 +538,8 @@ def main():
                     'protocol': '',
                     'banner': '',
                     'title': '',
-                    'product': ''
+                    'product': '',
+                    'location': ''
                 }
                 
                 # 填充资产信息
@@ -552,7 +558,7 @@ def main():
                 "total": total_assets,
                 "size": len(current_page_results),
                 "results": current_page_results,
-                "fields": "host,ip,port,title,protocol,banner,product",
+                "fields": "host,ip,port,title,protocol,banner,product,country_name,region,city",
                 "scroll_id": scroll_id  # 始终传递scroll_id
             }
             
@@ -591,7 +597,7 @@ def main():
                 'error': str(e)
             }
             print(yaml.dump(error_data, allow_unicode=True))
-            sys.exit(1)
+            return
     
     # 非scrollid请求，使用agent搜索处理所有搜索请求
     try:
@@ -603,17 +609,20 @@ def main():
         # 配置递归限制和线程ID
         config = {
             "configurable": {"thread_id": session_id},
-            "recursion_limit": 20  # 增加递归限制到20
+            "recursion_limit": 30  # 增加递归限制到30
         }
         
         # 添加系统提示，确保agent了解新功能
-        system_message = "你是fofa网络资产搜索助手，负责把用户的搜索需求转换成fofa的搜索语句，提交给fofa_search工具执行，fofa_search工具会返回一个字典结果，你需要原封不动地返回这个结果，不要添加任何额外解释或格式化。"
+        # 生成一个scroll_id用于本次搜索
+        new_scroll_id=generate_scroll_id()
+        system_message = f"你是fofa网络资产搜索助手，负责把用户的搜索需求转换成fofa的搜索语句，提交给fofa_search工具执行，fofa_search工具会返回一个字典结果，你需要原封不动地返回这个结果，不要添加任何额外解释或格式化。本次搜索使用的scroll_id为{new_scroll_id}"
         
         # 收集工具调用结果
         search_results = None
         cumulative_assets = []
         total_fetched = 0
         current_page = 1
+        
         
         # 执行agent获取第一页结果
         for chunk in agent.stream(
@@ -625,68 +634,26 @@ def main():
                     try:
                         content = tool_call.content
                         if content and isinstance(content, str):
-                            # 使用新的parse_json_response函数简化JSON解析
-                            search_results = parse_json_response(content, search_request)
+                            # 使用新的parse_json_response函数简化JSON解析，传递test_error参数
+                            search_results = parse_json_response(content, search_request, test_error=test_json)
                             break  # 获取到结果后立即跳出循环
                     except Exception as e:
                         print(f"解析结果错误: {str(e)}")
                         search_results = {"success": False, "error": f"解析结果错误: {str(e)}"}
         
-        # 如果搜索成功，尝试自动分页获取更多结果（最多200个）
-        if search_results and search_results.get('success'):
-            # 计算需要的总页数
-            total = search_results.get('total', 0)
-            # 确定实际要获取的结果总数（不超过MAX_RESULT）
-            actual_max_results = min(total, MAX_RESULT)
-            # 计算总页数
-            total_pages = (actual_max_results + 19) // 20  # 向上取整
+        # 如果搜索成功，从保存的文件中读取完整结果
+        if search_results and search_results.get('success') and search_results.get('scroll_id'):
+            scroll_id = search_results.get('scroll_id')
+            # 从文件中加载完整结果
+            saved_results = load_search_result_from_file(scroll_id)
             
-            # 如果total为0但有结果，重新计算
-            if total == 0 and len(search_results.get('results', [])) > 0:
-                actual_max_results = min(len(search_results.get('results', [])), MAX_RESULT)
-                total_pages = (actual_max_results + 19) // 20
-            
-            # 如果需要分页
-            if actual_max_results > 20 and current_page < total_pages:
-                try:
-                    fofa = FofaAPI()
-                    current_scroll_id = search_results.get('scroll_id')
-                    
-                    # 保存第一页的结果
-                    first_page_results = search_results.get('results', [])
-                    cumulative_assets.extend(first_page_results)
-                    total_fetched = len(cumulative_assets)
-                    current_page = 2
-                    
-                    # 循环获取剩余页面
-                    while current_scroll_id and total_fetched < actual_max_results and current_page <= total_pages:
-                        # 获取下一页结果
-                        next_page_data = fofa.search(
-                            query_str=search_results.get('query', ''),
-                            size=20,  # 每页20条
-                            fields=search_results.get('fields', 'host,ip,port,title,protocol,banner,product'),
-                            scroll=current_scroll_id
-                        )
-                        
-                        # 添加新结果
-                        next_results = next_page_data.get('results', [])
-                        cumulative_assets.extend(next_results)
-                        total_fetched = len(cumulative_assets)
-                        
-                        # 更新scroll_id
-                        current_scroll_id = next_page_data.get('scroll_id')
-                        current_page += 1
-                        
-                        # 如果没有更多结果或已达到最大数量，停止
-                        if not next_results or total_fetched >= actual_max_results:
-                            break
-                    
-                    # 更新搜索结果
-                    search_results['results'] = cumulative_assets
-                    search_results['size'] = len(cumulative_assets)
-                except Exception as e:
-                    print(f"自动分页过程中发生错误: {str(e)}")
-                    # 继续使用已获取的结果
+            if saved_results:
+                # 更新搜索结果为完整的保存结果
+                search_results['results'] = saved_results.get('results', [])
+                search_results['size'] = len(saved_results.get('results', []))
+                search_results['total'] = saved_results.get('total', 0)
+            else:
+                print(f"警告: 无法从文件加载完整结果，使用原始结果")
         
         # 格式化并输出YAML结果
         if search_results and search_results.get('success'):
@@ -694,34 +661,51 @@ def main():
             total_assets = len(search_results.get('results', []))
             actual_total_pages = (total_assets + 19) // 20
             
-            # 生成随机的scrollid
-            scroll_id = generate_scroll_id()
+            # 确保使用从fofa_search获取的scroll_id，不再生成新的scrollid
+            scroll_id = search_results.get('scroll_id')
             
-            # 保存所有搜索结果到文件
+            # 更新保存的搜索结果，添加分页信息
             saved_data = {
                 'query': search_results.get('query', ''),
                 'total': search_results.get('total', 0),
-                'scroll_id': scroll_id,  # 使用我们生成的随机ID
+                'scroll_id': scroll_id,  # 使用已有的scroll_id
                 'next_page_index': 0,  # 下一页的起始索引，从0开始
                 'results': search_results.get('results', []),  # 保存所有结果
                 'total_fetched': total_assets
             }
             file_path = save_search_result_to_file(scroll_id, saved_data)
             
-            # 更新搜索结果中的scroll_id为我们生成的随机ID
+            # 确保搜索结果中的scroll_id保持不变
             search_results['scroll_id'] = scroll_id
             
+            # 格式化前20条结果为正确的字典列表
+            top_20_results = search_results.get('results', [])[:20]
+            formatted_top_20 = []
+            for idx, asset in enumerate(top_20_results, 1):
+                formatted_asset = {
+                    "id": idx,
+                    "host": asset[0],
+                    "ip": asset[1],
+                    "port": asset[2],
+                    "title": asset[3],
+                    "protocol": asset[4],
+                    "banner": asset[5],
+                    "product": asset[6],
+                    "location": f"{asset[7]},{asset[8]},{asset[9]}"
+                }
+                formatted_top_20.append(formatted_asset)
+                
             yaml_output = format_results_to_yaml(
                 search_results, 
                 search_request,
-                cumulative_assets=search_results.get('results', [])[:20],  # 只显示前20条
+                cumulative_assets=formatted_top_20,  # 传递格式化后的前20条结果
                 current_page=1,
                 total_pages=actual_total_pages
             )
             if yaml_output:
                 print(yaml_output)
                 print(f"提示: 搜索结果已全部保存到 {file_path}")
-                print(f"提示: 使用 'python fofa-agent.py scrollid: {scroll_id}' 继续查看下一页")
+                print(f"提示: 使用 'python fofa_agent.py \'scrollid: {scroll_id}\' 继续查看下一页")
         else:
             # 输出错误信息的YAML格式
             error_data = {
@@ -730,7 +714,7 @@ def main():
                 'error': search_results.get('error', '搜索失败') if search_results else '未获取到搜索结果'
             }
             print(yaml.dump(error_data, allow_unicode=True))
-                     
+                      
     except Exception as e:
         # 输出异常的YAML格式
         error_data = {
@@ -739,7 +723,26 @@ def main():
             'error': str(e)
         }
         print(yaml.dump(error_data, allow_unicode=True))
+
+def main():
+    """主程序入口，解析命令行参数并调用核心功能"""
+    
+    # 检查参数
+    if len(sys.argv) < 2:
+        print("用法: python fofa-agent.py '查找域名example.com的所有资产' 或 python fofa-agent.py 'scrollid: xxxxxxx'")
+        print(f"说明: 程序支持自动分页获取最多{MAX_RESULT}个资产，每次返回20条")
+        print("测试模式: python fofa-agent.py '<搜索关键词>' --test-json")
         sys.exit(1)
+    
+    # 提取搜索查询和测试模式标志
+    search_request = sys.argv[1]
+    test_json = "--test-json" in sys.argv
+    
+    # 调用核心功能函数，传递测试模式标志
+    if test_json:
+        fofa_agentic_search(search_request, test_json=test_json)
+    else:
+        fofa_agentic_search(search_request)
 
 if __name__ == "__main__":
     main()

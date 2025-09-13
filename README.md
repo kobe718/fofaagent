@@ -1,6 +1,20 @@
 # Fofa搜索Agent
 
-这是一个基于React框架构建的智能Agent，集成了Fofa网络资产搜索功能，可以帮助用户快速查询和分析网络资产信息。
+这是一个基于LangGraph框架构建的智能Agent，集成了Fofa网络资产搜索功能，可以帮助用户快速查询和分析网络资产信息。
+
+## LangSmith中只显示system_message的原因
+
+在代码实现中，FOFA Agent有两个层次的提示词设置：
+
+1. **REACT_AGENT_PROMPT**：在`create_react_agent_for_fofa()`函数中通过`prompt`参数传递给`create_react_agent()`
+2. **system_message**：在`fofa_agentic_search()`函数中通过`agent.stream()`的`messages`参数传递
+
+在LangSmith中只看到system_message而看不到REACT_AGENT_PROMPT的原因是：
+- `create_react_agent()`函数将prompt封装在Agent内部结构中，作为Agent的基础指令
+- `agent.stream()`方法传递的messages是实际发送给模型的对话历史，包括系统消息和用户查询
+- LangSmith主要跟踪和显示实际与模型交互的消息序列，而不是Agent的内部配置参数
+
+这种设计是合理的，因为基础prompt定义了Agent的长期行为模式，而system_message提供了针对特定任务的即时指令。
 
 ## 功能特性
 

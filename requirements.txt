@@ -5,6 +5,7 @@ litellm
 python-dotenv
 pyyaml
 requests
+langsmith
 
 # 可选依赖（用于OpenAI模型支持）
 # langchain-openai
