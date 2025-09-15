@@ -58,3 +58,4 @@ venv/
 # Package manager
 .pip/
 .pypirc
+burp.crt
